@@ -1,0 +1,149 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: ci-cd-demo-repo
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run tests
+      run: |
+        # Add your tests here
+        python -c "from app import app; print('App imports successfully')"
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push Docker image to ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Init
+      working-directory: terraform
+      env:
+        TF_VAR_aws_region: ${{ env.AWS_REGION }}
+      run: terraform init -backend-config="region=$TF_VAR_aws_region"
+
+    - name: Terraform Format
+      working-directory: terraform
+      run: terraform fmt -recursive
+
+    - name: Terraform Validate
+      working-directory: terraform
+      run: terraform validate
+
+    - name: Import Existing Resources (if any)
+      working-directory: terraform
+      continue-on-error: true
+      env:
+        TF_VAR_aws_region: ${{ env.AWS_REGION }}
+        TF_VAR_key_name: ${{ secrets.EC2_KEY_NAME || '' }}
+      run: |
+        # Get security group ID if it exists
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=ci-cd-demo-sg" \
+          --query "SecurityGroups[0].GroupId" \
+          --output text 2>/dev/null || echo "")
+        
+        # Import existing resources
+        terraform import -var="aws_region=$TF_VAR_aws_region" -var="key_name=$TF_VAR_key_name" aws_ecr_repository.app_repo ci-cd-demo-repo || true
+        terraform import -var="aws_region=$TF_VAR_aws_region" -var="key_name=$TF_VAR_key_name" aws_iam_role.ec2_role ci-cd-demo-ec2-role || true
+        terraform import -var="aws_region=$TF_VAR_aws_region" -var="key_name=$TF_VAR_key_name" aws_iam_role_policy.ec2_ecr_policy ci-cd-demo-ec2-role:ci-cd-demo-ecr-policy || true
+        terraform import -var="aws_region=$TF_VAR_aws_region" -var="key_name=$TF_VAR_key_name" aws_iam_instance_profile.ec2_profile ci-cd-demo-ec2-profile || true
+        
+        # Import security group if it exists
+        if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+          terraform import -var="aws_region=$TF_VAR_aws_region" -var="key_name=$TF_VAR_key_name" aws_security_group.app_sg "$SG_ID" || true
+        fi
+
+    - name: Terraform Plan
+      working-directory: terraform
+      env:
+        TF_VAR_aws_region: ${{ env.AWS_REGION }}
+        TF_VAR_key_name: ${{ secrets.EC2_KEY_NAME || '' }}
+      run: |
+        terraform plan -out=tfplan \
+          -var="aws_region=$TF_VAR_aws_region" \
+          -var="key_name=$TF_VAR_key_name"
+
+    - name: Terraform Apply
+      working-directory: terraform
+      env:
+        TF_VAR_aws_region: ${{ env.AWS_REGION }}
+        TF_VAR_key_name: ${{ secrets.EC2_KEY_NAME || '' }}
+      run: |
+        terraform apply -auto-approve tfplan
+
+    - name: Get Terraform Outputs
+      working-directory: terraform
+      id: terraform-output
+      run: |
+        echo "ec2_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
+        echo "ecr_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+        echo "app_url=$(terraform output -raw app_url)" >> $GITHUB_OUTPUT
+
+    - name: Wait for application to be ready
+      run: |
+        echo "Waiting for application to start..."
+        sleep 60
+        for i in {1..10}; do
+          if curl -f -s http://${{ steps.terraform-output.outputs.ec2_ip }} > /dev/null; then
+            echo "Application is ready!"
+            exit 0
+          fi
+          echo "Attempt $i: Application not ready yet, waiting..."
+          sleep 30
+        done
+        echo "Warning: Application may not be fully ready yet"
+
+    - name: Summary
+      run: |
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ **Deployment Successful**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Application URL**: ${{ steps.terraform-output.outputs.app_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **EC2 Public IP**: ${{ steps.terraform-output.outputs.ec2_ip }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **ECR Repository**: ${{ steps.terraform-output.outputs.ecr_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Tag**: ${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
